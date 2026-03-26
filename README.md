@@ -1,6 +1,6 @@
 <div align="center">
 
-# VFS Neuro-Symbolic Research System
+# Neuro-Symbolic Research System
 
 **A hybrid academic research pipeline combining Large Language Models with formal symbolic reasoning**
 
