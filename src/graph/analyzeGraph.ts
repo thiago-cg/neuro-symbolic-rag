@@ -4,19 +4,18 @@ import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { ingestFiles } from "../ingest/fileIngestor.js";
 import { extractTriplesFromData } from "../ingest/dataTripleExtractor.js";
-import { ClingoEngine } from "../reasoner/clingoEngine.js";
 import { Neo4jClient } from "../knowledge_base/neo4jClient.js";
 import { getConfig } from "../config.js";
 import { withLlmRetry } from "../retry.js";
 import { getLogger } from "../observability.js";
 import { TripleSchema, type Triple } from "./state.js";
 import { writeAnalysisSheet } from "../ingest/excelParser.js";
-import { z } from "zod";
+import { reasonDatalogNode, reasonAspConflictsNode } from "./nodes.js";
 
 const log = getLogger("graph:analyze");
 
 // ─── State ────────────────────────────────────────────────────────────────────
-const AnalyzeState = Annotation.Root({
+export const AnalyzeState = Annotation.Root({
   dataFiles: Annotation<string[]>(),
   refFiles: Annotation<string[]>(),
   instruction: Annotation<string>(),
@@ -40,7 +39,7 @@ const AnalyzeState = Annotation.Root({
   report: Annotation<string>({ default: () => "", reducer: (_, v) => v }),
 });
 
-type AnalyzeStateType = typeof AnalyzeState.State;
+export type AnalyzeStateType = typeof AnalyzeState.State;
 
 function getLlm() {
   const cfg = getConfig();
@@ -101,17 +100,25 @@ async function persistDataNode(state: AnalyzeStateType) {
   return {};
 }
 
-async function reasonNode(state: AnalyzeStateType) {
-  const engine = new ClingoEngine();
-  const { inferredFacts, conflicts } = await engine.runDatalog(state.extractedTriples);
+// Wrapping the existing logic nodes since they expect a generic state
+// but they access properties common to both state types:
+// `extractedTriples`, `inferredFacts`, `conflicts`, `answerSets`.
 
-  let answerSets: string[][] = [];
-  if (conflicts.length > 0) {
-    const cfg = getConfig();
-    answerSets = await engine.runAsp(state.extractedTriples, cfg.clingoMaxModels);
-  }
+async function wrappedReasonDatalogNode(state: AnalyzeStateType) {
+  // We can pass the AnalyzeStateType into reasonDatalogNode as long as it fits the expected signature.
+  // We'll safely await it. It returns inferredFacts and conflicts.
+  return reasonDatalogNode(state as any);
+}
 
-  return { inferredFacts, conflicts, answerSets };
+async function wrappedReasonAspConflictsNode(state: AnalyzeStateType) {
+  // Returns answerSets
+  return reasonAspConflictsNode(state as any);
+}
+
+export function analyzeShouldRunAsp(
+  state: AnalyzeStateType,
+): "reason_asp_conflicts" | "synthesize_report" {
+  return state.conflicts.length > 0 ? "reason_asp_conflicts" : "synthesize_report";
 }
 
 async function synthesizeReportNode(state: AnalyzeStateType) {
@@ -129,8 +136,13 @@ The report must:
 1. Answer the user's instruction directly
 2. Present key findings grounded in the data triples
 3. Highlight patterns and relationships discovered
-4. Note any conflicts or contradictions found
+4. Note any conflicts or contradictions found and how ASP conflict resolution models handled them
 5. Include a conclusions section`;
+
+  let answerSetsText = "";
+  if (state.answerSets && state.answerSets.length > 0) {
+     answerSetsText = `\nAnswer Sets (ASP resolved conflicts):\n${state.answerSets.map((s,i) => `Set ${i+1}: ${s.join(", ")}`).join("\n")}`;
+  }
 
   const userPrompt = `Instruction: ${state.instruction}
 
@@ -145,6 +157,7 @@ ${state.inferredFacts.slice(0, 20).join("\n  ")}
 
 Conflicts detected: ${state.conflicts.length}
 ${state.conflicts.slice(0, 5).join("\n  ")}
+${answerSetsText}
 
 Write a comprehensive analysis report in Markdown.`;
 
@@ -176,21 +189,30 @@ async function exportResultNode(state: AnalyzeStateType) {
 // ─── Graph ────────────────────────────────────────────────────────────────────
 
 function buildAnalyzeGraph() {
-  return new StateGraph(AnalyzeState)
+  const graph = new StateGraph(AnalyzeState)
     .addNode("ingest_files", ingestFilesNode)
     .addNode("extract_data_triples", extractDataTriplesNode)
     .addNode("persist", persistDataNode)
-    .addNode("reason", reasonNode)
+    .addNode("reason_datalog", wrappedReasonDatalogNode)
+    .addNode("reason_asp_conflicts", wrappedReasonAspConflictsNode)
     .addNode("synthesize_report", synthesizeReportNode)
     .addNode("export_result", exportResultNode)
+
     .addEdge(START, "ingest_files")
     .addEdge("ingest_files", "extract_data_triples")
     .addEdge("extract_data_triples", "persist")
-    .addEdge("persist", "reason")
-    .addEdge("reason", "synthesize_report")
+    .addEdge("persist", "reason_datalog")
+
+    // Conditional routing identical to the Research Graph
+    .addConditionalEdges("reason_datalog", analyzeShouldRunAsp, [
+      "reason_asp_conflicts",
+      "synthesize_report",
+    ])
+    .addEdge("reason_asp_conflicts", "synthesize_report")
     .addEdge("synthesize_report", "export_result")
-    .addEdge("export_result", END)
-    .compile();
+    .addEdge("export_result", END);
+
+  return graph.compile();
 }
 
 let _analyzeGraph: ReturnType<typeof buildAnalyzeGraph> | undefined;
