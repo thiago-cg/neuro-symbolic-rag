@@ -4,6 +4,22 @@ import { Command } from "commander";
 import * as p from "@clack/prompts";
 import chalk from "chalk";
 import { getLogger } from "./observability.js";
+import boxen from "boxen";
+import figlet from "figlet";
+import gradient from "gradient-string";
+
+
+function printBanner() {
+  const asciiArt = figlet.textSync("VFS System", { font: "Standard" });
+  const styledBanner = boxen(gradient.pastel.multiline(asciiArt), {
+    padding: 1,
+    margin: 1,
+    borderStyle: "round",
+    borderColor: "cyan",
+    align: "center",
+  });
+  console.log(styledBanner);
+}
 
 const log = getLogger("cli");
 const program = new Command();
@@ -20,7 +36,8 @@ program
   .option("-s, --stream", "Stream progress events to stdout", false)
   .action(async (query: string, opts: { stream: boolean }) => {
     const { runResearchGraph } = await import("./graph/graph.js");
-    p.intro(chalk.cyan("VFS Research"));
+    printBanner();
+    p.intro(chalk.bgCyan.black(" VFS Research "));
 
     const spin = p.spinner();
     spin.start("Running research pipeline…");
@@ -28,14 +45,14 @@ program
       const result = await runResearchGraph(query, opts.stream ? (event: string) => {
         p.log.step(event);
       } : undefined);
-      spin.stop("Done");
-      p.note(result.answer ?? "No answer produced", "Result");
+      spin.stop(chalk.green("✔ Done"));
+      p.note(result.answer ?? chalk.gray("No answer produced"), chalk.bold.green("Result"));
     } catch (err) {
-      spin.stop("Failed");
+      spin.stop(chalk.red("✖ Failed"));
       p.log.error(String(err));
       process.exitCode = 1;
     }
-    p.outro("Research complete");
+    p.outro(chalk.bold("Research complete ✨"));
   });
 
 // ─── analyze ─────────────────────────────────────────────────────────────────
@@ -54,7 +71,8 @@ program
       output?: string;
     }) => {
       const { runAnalyzeGraph } = await import("./graph/analyzeGraph.js");
-      p.intro(chalk.magenta("VFS Data Analysis"));
+      printBanner();
+      p.intro(chalk.bgMagenta.black(" VFS Data Analysis "));
 
       // Fill missing options interactively
       if (!opts.data) {
@@ -91,7 +109,7 @@ program
         p.log.error(String(err));
         process.exitCode = 1;
       }
-      p.outro("Analysis complete");
+      p.outro(chalk.bold("Analysis complete ✨"));
     },
   );
 
@@ -146,7 +164,8 @@ program
 
 // ─── Interactive mode (no args) ───────────────────────────────────────────────
 async function interactiveMode() {
-  p.intro(chalk.bold.cyan("VFS Neuro-Symbolic System"));
+  printBanner();
+  p.intro(chalk.bgBlue.white.bold(" VFS Neuro-Symbolic System "));
 
   const action = await p.select({
     message: "What would you like to do?",
