@@ -70,16 +70,27 @@ export async function researchNode(state: ResearchStateType) {
 
 // ─── Node 3: extractTriples ───────────────────────────────────────────────────
 export async function extractTriplesNode(state: ResearchStateType) {
-  log.info({ papers: state.papers.length }, "Extracting triples");
+  log.info({ papers: state.papers.length }, "Extracting triples via iterative agents");
 
   const cfg = getConfig();
   const minConf = cfg.minTripleConfidence;
 
-  const results = await Promise.all(
-    state.papers
-      .filter((p) => p.abstract)
-      .map((p) => extractFromPaper(p)),
-  );
+  // Concurrency control to avoid OpenRouter 429 Too Many Requests
+  // Since each paper triggers a multi-turn agent, we limit active papers to 2.
+  const MAX_CONCURRENT_PAPERS = 2;
+  const papersToProcess = state.papers.filter((p) => p.abstract);
+  const results: Triple[][] = [];
+
+  for (let i = 0; i < papersToProcess.length; i += MAX_CONCURRENT_PAPERS) {
+     const batch = papersToProcess.slice(i, i + MAX_CONCURRENT_PAPERS);
+     log.info({ batch: i/MAX_CONCURRENT_PAPERS + 1, total_papers: papersToProcess.length }, "Processing batch of papers");
+
+     const batchResults = await Promise.all(
+       batch.map((p) => extractFromPaper(p))
+     );
+
+     results.push(...batchResults);
+  }
 
   const triples = results
     .flat()
