@@ -1,5 +1,5 @@
 import { getConfig } from "../config.js";
-import { searchSemanticScholar, searchArXiv, fetchAndParsePdf } from "./academicTools.js";
+import { searchSemanticScholar, searchArXiv } from "./academicTools.js";
 import { deduplicatePapers } from "./harvester.js";
 import type { Paper } from "../graph/state.js";
 import { getLogger } from "../observability.js";
@@ -70,7 +70,8 @@ export async function runSubAgent(params: {
            new HumanMessage(prompt),
          ])
        );
-       newQueries = JSON.parse(result.content as string) as string[];
+       const cleanContent = (result.content as string).replace(/```json/g, '').replace(/```/g, '').trim();
+       newQueries = JSON.parse(cleanContent) as string[];
     } catch (e) {
        log.warn({ subTopic: params.subTopic }, "Failed to expand queries, continuing with PASS 1 results only");
     }
@@ -97,21 +98,7 @@ export async function runSubAgent(params: {
   // Consolidação
   const allPapers = deduplicatePapers([...pass1Papers, ...pass2Papers]);
 
-  // Opcional: Baixar e parsear PDFs para os top papers se url for um PDF
-  // Limitar para não abusar do acesso
-  for (const p of allPapers.slice(0, cfg.maxPapers)) {
-    if (p.url && (p.url.endsWith(".pdf") || p.url.includes("pdf"))) {
-      try {
-        const text = await fetchAndParsePdf(p.url);
-        if (text) {
-          p.fullText = text;
-          log.debug({ paperId: p.paperId }, "Successfully extracted full text from PDF");
-        }
-      } catch (e) {
-        // Silently ignore PDF fetch errors
-      }
-    }
-  }
+
 
   log.debug(
     { subTopic: params.subTopic, found: allPapers.length },

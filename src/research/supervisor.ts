@@ -2,6 +2,7 @@ import { getConfig } from "../config.js";
 import { runSubAgent } from "./subAgent.js";
 import { harvestPapers } from "./harvester.js";
 import { rerankPapers } from "./evaluator.js";
+import { fetchAndParsePdf } from "./academicTools.js";
 import type { Paper } from "../graph/state.js";
 import { getLogger } from "../observability.js";
 
@@ -35,6 +36,27 @@ export async function runSupervisor(params: {
   const rerankedPapers = await rerankPapers(intent, papers);
 
   log.info({ totalFiltered: rerankedPapers.length }, "Supervisor finished processing papers");
+
+
+  log.info({ count: rerankedPapers.length }, "Supervisor fetching full texts for top ranked papers");
+
+  // Apenas baixar PDF dos artigos aprovados e limitar a top 3 para não travar o processo
+  const TOP_PDF_LIMIT = 3;
+  for (let i = 0; i < Math.min(rerankedPapers.length, TOP_PDF_LIMIT); i++) {
+    const p = rerankedPapers[i];
+    if (p && p.url && (p.url.endsWith(".pdf") || p.url.includes("pdf"))) {
+      try {
+        log.debug({ paperId: p.paperId }, "Fetching PDF for highly ranked paper");
+        const text = await fetchAndParsePdf(p.url);
+        if (text) {
+          p.fullText = text;
+          log.debug({ paperId: p.paperId, textLength: text.length }, "Successfully extracted full text from PDF");
+        }
+      } catch (e) {
+        log.warn({ paperId: p.paperId }, "Silent fail on fetching PDF for ranked paper");
+      }
+    }
+  }
 
   return rerankedPapers;
 }

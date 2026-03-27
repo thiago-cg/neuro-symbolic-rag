@@ -50,7 +50,8 @@ export async function rerankPapers(intent: string, papers: Paper[]): Promise<Pap
             ])
           );
 
-          const parsed = JSON.parse(result.content as string) as { score: number, reason: string };
+          const cleanJson = (result.content as string).replace(/```json/g, '').replace(/```/g, '').trim();
+          const parsed = JSON.parse(cleanJson) as { score: number, reason: string };
           paper.score = parsed.score;
         } catch (e) {
           log.warn({ paperId: paper.paperId }, "Failed to rerank paper, defaulting score to 5");

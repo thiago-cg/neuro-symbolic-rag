@@ -127,11 +127,20 @@ function parseArXivXml(xml: string): Paper[] {
 export async function fetchAndParsePdf(url: string): Promise<string | undefined> {
     try {
         log.debug({ url }, "Attempting to fetch and parse PDF");
-        const res = await fetch(url, {
-            headers: {
-                "User-Agent": "VFS-Research/0.1"
-            }
-        });
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000); // 15s timeout
+
+        let res;
+        try {
+            res = await fetch(url, {
+                headers: {
+                    "User-Agent": "VFS-Research/0.1"
+                },
+                signal: controller.signal
+            });
+        } finally {
+            clearTimeout(timeout);
+        }
         if (!res.ok) {
            log.warn({ url, status: res.status }, "Failed to fetch PDF");
            return undefined;
