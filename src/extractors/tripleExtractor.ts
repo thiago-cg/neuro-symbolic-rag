@@ -31,22 +31,72 @@ function getAgentLlm() {
 }
 
 function getTempFilePath(paperId: string) {
-  return path.join(TMP_DIR, `${paperId}_triples.json`);
+  const safeId = paperId.replace(/[^a-zA-Z0-9_-]/g, '_');
+  return path.join(TMP_DIR, `${safeId}_triples.json`);
 }
+
+function getEntitiesFilePath(paperId: string) {
+  const safeId = paperId.replace(/[^a-zA-Z0-9_-]/g, '_');
+  return path.join(TMP_DIR, `${safeId}_entities.json`);
+}
+
+// Global dictionary to hold texts for the active agents
+const TEXT_CACHE = new Map<string, string>();
 
 // ==========================================
 // TOOLS FOR THE AGENT
 // ==========================================
 
-const identifyEntitiesTool = tool(
-  async ({ entities }) => {
-    return `Entities identified: ${entities.join(", ")}. Now proceed to extract triples connecting these entities using the allowed predicates.`;
+const readTextChunkTool = tool(
+  async ({ paperId, startChar, length }) => {
+    const text = TEXT_CACHE.get(paperId);
+    if (!text) return `Error: No text found for paper ID ${paperId}`;
+
+    if (startChar >= text.length) {
+      return `End of Document Reached. The text has only ${text.length} characters.`;
+    }
+
+    const chunk = text.slice(startChar, startChar + length);
+    const progress = Math.min(((startChar + chunk.length) / text.length) * 100, 100).toFixed(1);
+
+    return `--- CHUNK START (Progress: ${progress}%) ---\n${chunk}\n--- CHUNK END ---`;
   },
   {
-    name: "identify_entities",
-    description: "Use this first to list the core entities (methods, problems, concepts, prior works) found in the text. This list will be your target to ensure 100% Entity-Relation Completeness.",
+    name: "read_text_chunk",
+    description: "Read a specific segment of the document by character index. Use this iteratively to explore the whole document.",
     schema: z.object({
-      entities: z.array(z.string()).describe("List of core entities found in the text"),
+      paperId: z.string().describe("The ID of the paper to read"),
+      startChar: z.number().describe("The character index to start reading from. Starts at 0."),
+      length: z.number().describe("How many characters to read. Recommend between 500 and 1500."),
+    }),
+  }
+);
+
+const saveTargetEntitiesTool = tool(
+  async ({ paperId, entities }) => {
+    try {
+      const file = getEntitiesFilePath(paperId);
+
+      let existing: string[] = [];
+      if (fs.existsSync(file)) {
+        existing = JSON.parse(fs.readFileSync(file, "utf-8"));
+      }
+
+      const newEntities = entities.filter(e => !existing.includes(e));
+      const combined = [...existing, ...newEntities];
+
+      fs.writeFileSync(file, JSON.stringify(combined, null, 2));
+      return `Added ${newEntities.length} new entities. Total tracking entities: ${combined.length}. Currently tracking: ${combined.join(", ")}`;
+    } catch (err) {
+      return `Failed to save entities: ${err}`;
+    }
+  },
+  {
+    name: "save_target_entities",
+    description: "As you read chunks of text, use this tool to persist new concepts, methods, and works you discover into your Target Entity Database.",
+    schema: z.object({
+      paperId: z.string().describe("The ID of the current paper"),
+      entities: z.array(z.string()).describe("List of new core entities found in the current text chunk"),
     }),
   }
 );
@@ -78,7 +128,7 @@ const saveTriplesTool = tool(
   },
   {
     name: "save_triples",
-    description: "Saves a batch of extracted triples to a temporary file. Always use this when you find new relations. Requires a valid JSON array string.",
+    description: "Saves a batch of extracted triples to a temporary file. Requires a valid JSON array string.",
     schema: z.object({
       paperId: z.string().describe("The ID of the current paper"),
       triplesRaw: z.string().describe("A valid JSON array string of triples. Valid predicates: 'cita', 'supera', 'usa', 'trata_conceito', 'define', 'contradiz', 'estende'."),
@@ -87,12 +137,16 @@ const saveTriplesTool = tool(
 );
 
 const evaluateCoverageTool = tool(
-  async ({ paperId, coreEntities }) => {
-    const file = getTempFilePath(paperId);
-    if (!fs.existsSync(file)) return "0% coverage. No triples saved yet. You must use 'save_triples' first.";
+  async ({ paperId }) => {
+    const entFile = getEntitiesFilePath(paperId);
+    if (!fs.existsSync(entFile)) return "0% coverage. No target entities registered yet. Use 'save_target_entities' while reading.";
+
+    const tripFile = getTempFilePath(paperId);
+    if (!fs.existsSync(tripFile)) return "0% coverage. No triples saved yet. Use 'save_triples' to map relations.";
 
     try {
-      const saved = JSON.parse(fs.readFileSync(file, "utf-8")) as any[];
+      const coreEntities = JSON.parse(fs.readFileSync(entFile, "utf-8")) as string[];
+      const saved = JSON.parse(fs.readFileSync(tripFile, "utf-8")) as any[];
       const coveredEntities = new Set<string>();
 
       saved.forEach(t => {
@@ -104,20 +158,19 @@ const evaluateCoverageTool = tool(
       const coverage = ((coreEntities.length - missing.length) / coreEntities.length) * 100;
 
       if (missing.length === 0) {
-         return "100% coverage achieved. All core entities are part of at least one triple. You may finish by outputting a final message.";
+         return "100% Entity-Relation Coverage achieved. All registered entities are part of at least one triple. You may finish by outputting a final message starting with DONE.";
       }
 
-      return `Coverage: ${coverage.toFixed(1)}%. Missing entities: ${missing.join(", ")}. Please search the text again to find relations for these missing entities. If no relation exists, explain why.`;
+      return `Coverage: ${coverage.toFixed(1)}%. Missing entities: ${missing.join(", ")}. Please re-read the text or extract relations for these missing entities. If no relation exists, explain why in your final output.`;
     } catch (e) {
-      return "Error reading saved triples for evaluation.";
+      return "Error reading saved files for evaluation.";
     }
   },
   {
     name: "evaluate_coverage",
-    description: "Evaluates if all identified core entities are present in the saved triples. Use this to check your progress towards 100% Entity-Relation completeness.",
+    description: "Evaluates if all registered target entities are present in the saved triples. Use this to check your progress towards 100% Entity-Relation completeness.",
     schema: z.object({
-      paperId: z.string().describe("The ID of the current paper"),
-      coreEntities: z.array(z.string()).describe("The list of entities you identified initially."),
+      paperId: z.string().describe("The ID of the current paper")
     }),
   }
 );
@@ -129,13 +182,18 @@ const evaluateCoverageTool = tool(
 export async function extractFromPaper(paper: Paper): Promise<Triple[]> {
   if (!paper.abstract) return [];
 
-  const file = getTempFilePath(paper.paperId);
-  if (fs.existsSync(file)) fs.unlinkSync(file);
+  // Initialize temporary storage
+  const tripFile = getTempFilePath(paper.paperId);
+  const entFile = getEntitiesFilePath(paper.paperId);
+  if (fs.existsSync(tripFile)) fs.unlinkSync(tripFile);
+  if (fs.existsSync(entFile)) fs.unlinkSync(entFile);
+
+  TEXT_CACHE.set(paper.paperId, paper.abstract);
 
   log.info({ paperId: paper.paperId }, "Starting iterative agentic extraction for paper");
 
   const llm = getAgentLlm();
-  const tools = [identifyEntitiesTool, saveTriplesTool, evaluateCoverageTool];
+  const tools = [readTextChunkTool, saveTargetEntitiesTool, saveTriplesTool, evaluateCoverageTool];
 
   const checkpointer = new MemorySaver();
   const agent = createReactAgent({
@@ -145,38 +203,37 @@ export async function extractFromPaper(paper: Paper): Promise<Triple[]> {
   });
 
   const SYSTEM_PROMPT = `You are an iterative Knowledge Extraction Agent working on a single academic paper.
-Your GOAL is to achieve 100% Entity-Relation Completeness on the provided text.
+Your GOAL is to thoroughly map the document, identify key entities, and achieve 100% Entity-Relation Completeness.
 
 RULES:
 1. ONLY use the following predicates for relations: "cita", "supera", "usa", "trata_conceito", "define", "contradiz", "estende".
-2. Process Workflow:
-   a) Call 'identify_entities' tool to list all significant concepts, methods, problems, and datasets.
-   b) Search the text and extract triples connecting these entities.
-   c) Call 'save_triples' tool with a JSON string of the discovered triples.
-   d) Call 'evaluate_coverage' tool using the core entities from step (a).
-   e) Repeat (b), (c), (d) until coverage is 100% OR you logically justify why a missing entity has no valid relations in the text.
-3. Once satisfied, write a final summary message and STOP.
+2. You do NOT have the document text yet. The document has ${paper.abstract.length} characters.
+3. Process Workflow:
+   a) Phase 1: EXPLORATION. Use 'read_text_chunk' to page through the text. As you read, aggressively register important concepts, datasets, models, and works using 'save_target_entities'.
+   b) Phase 2: EXTRACTION. You can extract triples as you read or re-read later. Save relations using 'save_triples'.
+   c) Phase 3: VERIFICATION. Call 'evaluate_coverage'. It will cross-check your saved entities against your saved triples.
+   d) If coverage < 100%, re-read specific parts or extract the missing relations.
+   e) Repeat until coverage is 100% OR you logically justify why a missing entity has no valid relations in the text.
+4. Once satisfied, write a final summary message starting with "DONE" and STOP.
 
 Paper Title: ${paper.title}
-Paper Abstract:
-${paper.abstract}
+Paper ID: ${paper.paperId}
 
-Begin by identifying entities!`;
+Begin by reading the first chunk of text!`;
 
   try {
     const threadId = `extract-${paper.paperId}-${Date.now()}`;
 
-    // We wrap the agent invocation in a basic retry to handle network errors,
-    // though the agent itself handles tool invocation errors internally.
     await withLlmRetry(async () => {
       // Clear file before each retry attempt to avoid duplicate appending
-      if (fs.existsSync(file)) fs.unlinkSync(file);
+      if (fs.existsSync(tripFile)) fs.unlinkSync(tripFile);
+      if (fs.existsSync(entFile)) fs.unlinkSync(entFile);
 
       return agent.invoke(
         {
           messages: [
             new SystemMessage(SYSTEM_PROMPT),
-            new HumanMessage(`Start extraction for paper ID: ${paper.paperId}`)
+            new HumanMessage(`Start exploration phase for paper ID: ${paper.paperId}`)
           ]
         },
         { configurable: { thread_id: threadId } }
@@ -184,12 +241,14 @@ Begin by identifying entities!`;
     });
 
     // Process finished. Read the final file produced by the agent.
-    if (fs.existsSync(file)) {
-      const raw = JSON.parse(fs.readFileSync(file, "utf-8")) as unknown[];
+    if (fs.existsSync(tripFile)) {
+      const raw = JSON.parse(fs.readFileSync(tripFile, "utf-8")) as unknown[];
       const validated = validateTriples(Array.isArray(raw) ? raw : []);
 
       // Cleanup
-      fs.unlinkSync(file);
+      fs.unlinkSync(tripFile);
+      if (fs.existsSync(entFile)) fs.unlinkSync(entFile);
+      TEXT_CACHE.delete(paper.paperId);
 
       const triples = validated.map((t) => ({ ...t, source: paper.paperId }));
       log.info({ paperId: paper.paperId, count: triples.length }, "Agent finished extraction successfully");
@@ -197,11 +256,14 @@ Begin by identifying entities!`;
     }
 
     log.warn({ paperId: paper.paperId }, "Agent finished but no triples were saved to disk.");
+    TEXT_CACHE.delete(paper.paperId);
     return [];
 
   } catch (err) {
     log.error({ paperId: paper.paperId, err }, "Agentic extraction failed completely");
-    if (fs.existsSync(file)) fs.unlinkSync(file); // cleanup on error
+    if (fs.existsSync(tripFile)) fs.unlinkSync(tripFile); // cleanup on error
+    if (fs.existsSync(entFile)) fs.unlinkSync(entFile);
+    TEXT_CACHE.delete(paper.paperId);
     return [];
   }
 }
