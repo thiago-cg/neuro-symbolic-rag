@@ -1,6 +1,7 @@
 import { getConfig } from "../config.js";
 import { runSubAgent } from "./subAgent.js";
 import { harvestPapers } from "./harvester.js";
+import { rerankPapers } from "./evaluator.js";
 import type { Paper } from "../graph/state.js";
 import { getLogger } from "../observability.js";
 
@@ -12,7 +13,7 @@ export async function runSupervisor(params: {
   subTopics: string[];
 }): Promise<Paper[]> {
   const cfg = getConfig();
-  const { domain, subTopics } = params;
+  const { domain, intent, subTopics } = params;
 
   // Limit parallelism
   const maxParallel = Math.min(cfg.maxParallelAgents, subTopics.length);
@@ -22,11 +23,18 @@ export async function runSupervisor(params: {
 
   // Run sub-agents in parallel
   const subResults = await Promise.all(
-    activeSubs.map((subTopic) => runSubAgent({ domain, subTopic })),
+    activeSubs.map((subTopic) => runSubAgent({ domain, subTopic, intent })),
   );
 
   // Harvest and deduplicate
   const papers = harvestPapers(subResults, cfg.maxPapers);
-  log.info({ total: papers.length }, "Supervisor harvested papers");
-  return papers;
+
+  log.info({ total: papers.length }, "Supervisor applying semantic reranking");
+
+  // Rerank via LLM (Avaliação Semântica)
+  const rerankedPapers = await rerankPapers(intent, papers);
+
+  log.info({ totalFiltered: rerankedPapers.length }, "Supervisor finished processing papers");
+
+  return rerankedPapers;
 }
