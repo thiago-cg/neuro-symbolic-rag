@@ -26,6 +26,8 @@ export const PaperSchema = z.object({
   authors: z.array(z.string()).default([]),
   year: z.number().optional(),
   url: z.string().optional(),
+  fullText: z.string().optional(),
+  score: z.number().optional(),
 });
 
 export type Paper = z.infer<typeof PaperSchema>;

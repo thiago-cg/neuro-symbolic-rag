@@ -2,6 +2,9 @@ import { getConfig } from "../config.js";
 import { withApiRetry } from "../retry.js";
 import type { Paper } from "../graph/state.js";
 import { getLogger } from "../observability.js";
+import { XMLParser } from "fast-xml-parser";
+import pdfParse from "pdf-parse";
+import { fetch } from "undici";
 
 const log = getLogger("research:academic");
 
@@ -64,25 +67,89 @@ export async function searchArXiv(query: string, maxResults = 10): Promise<Paper
   });
 }
 
+
 function parseArXivXml(xml: string): Paper[] {
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: "@_",
+    textNodeName: "#text"
+  });
+  const parsed = parser.parse(xml);
   const papers: Paper[] = [];
-  const entries = xml.match(/<entry>([\s\S]*?)<\/entry>/g) ?? [];
+
+  if (!parsed.feed || !parsed.feed.entry) return papers;
+
+  const entries = Array.isArray(parsed.feed.entry) ? parsed.feed.entry : [parsed.feed.entry];
 
   for (const entry of entries) {
-    const id = entry.match(/<id>(.*?)<\/id>/)?.[1] ?? "";
-    const title = entry.match(/<title>([\s\S]*?)<\/title>/)?.[1]?.trim() ?? "";
-    const abstract = entry.match(/<summary>([\s\S]*?)<\/summary>/)?.[1]?.trim();
-    const yearMatch = entry.match(/<published>(\d{4})/);
-    const year = yearMatch ? parseInt(yearMatch[1]!, 10) : undefined;
+    const id = entry.id || "";
+    const title = entry.title ? entry.title.replace(/\n/g, " ").trim() : "";
+    const abstract = entry.summary ? entry.summary.replace(/\n/g, " ").trim() : undefined;
 
-    const authorMatches = [...entry.matchAll(/<name>(.*?)<\/name>/g)];
-    const authors = authorMatches.map((m) => m[1] ?? "");
+    let year: number | undefined;
+    if (entry.published) {
+      const yearMatch = entry.published.match(/^(\d{4})/);
+      if (yearMatch) {
+        year = parseInt(yearMatch[1], 10);
+      }
+    }
+
+    let authors: string[] = [];
+    if (entry.author) {
+      const authorList = Array.isArray(entry.author) ? entry.author : [entry.author];
+      authors = authorList.map((a: any) => a.name || "");
+    }
+
+    // Try to find a PDF link
+    let pdfUrl = id; // Fallback to id url
+    if (entry.link) {
+      const links = Array.isArray(entry.link) ? entry.link : [entry.link];
+      const pdfLink = links.find((l: any) => l["@_title"] === "pdf" || (l["@_type"] && l["@_type"].includes("pdf")));
+      if (pdfLink && pdfLink["@_href"]) {
+        pdfUrl = pdfLink["@_href"];
+      } else {
+         // Fallback heuristic for arXiv: replace /abs/ with /pdf/
+         if (id.includes("/abs/")) {
+            pdfUrl = id.replace("/abs/", "/pdf/");
+         }
+      }
+    }
 
     if (id && title) {
-      papers.push({ paperId: id, title, abstract, authors, year, url: id });
+      papers.push({ paperId: id, title, abstract, authors, year, url: pdfUrl });
     }
   }
 
-  log.debug({ count: papers.length }, "ArXiv results parsed");
+  log.debug({ count: papers.length }, "ArXiv results parsed via fast-xml-parser");
   return papers;
+}
+
+export async function fetchAndParsePdf(url: string): Promise<string | undefined> {
+    try {
+        log.debug({ url }, "Attempting to fetch and parse PDF");
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000); // 15s timeout
+
+        let res;
+        try {
+            res = await fetch(url, {
+                headers: {
+                    "User-Agent": "VFS-Research/0.1"
+                },
+                signal: controller.signal
+            });
+        } finally {
+            clearTimeout(timeout);
+        }
+        if (!res.ok) {
+           log.warn({ url, status: res.status }, "Failed to fetch PDF");
+           return undefined;
+        }
+        const buffer = await res.arrayBuffer();
+        const data = await pdfParse(Buffer.from(buffer));
+        return data.text;
+    } catch (error) {
+        log.error({ url, error }, "Error parsing PDF");
+        return undefined;
+    }
 }
